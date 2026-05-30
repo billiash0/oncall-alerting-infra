@@ -104,7 +104,6 @@ services:
     image: grafana/oncall:latest
     container_name: oncall-celery
     restart: always
-    working_dir: /etc/app
     command: celery -A engine worker -l info -Q default,critical,slack,telegram,webhook,retry --concurrency=4
     environment:
       DJANGO_SETTINGS_MODULE: settings.dev
@@ -128,14 +127,14 @@ services:
     container_name: oncall-grafana
     restart: always
     environment:
-      # Автоматически установить плагин (раскомментируйте, если работает VPN)
       GF_INSTALL_PLUGINS: grafana-oncall-app
+      GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_FEATURE_TOGGLES_ENABLE: externalServiceAccounts
     ports:
       - "3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
-      # Provisioning для автоматической настройки плагина
       - ./provisioning/plugins:/etc/grafana/provisioning/plugins:ro
 
   # -------------------------- n8n --------------------------

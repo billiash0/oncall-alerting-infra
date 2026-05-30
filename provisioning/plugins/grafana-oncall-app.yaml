@@ -1,0 +1,11 @@
+apiVersion: 1
+
+apps:
+  - type: grafana-oncall-app
+    disabled: false
+    jsonData:
+      stackId: 0        # 0 = self-hosted (не Grafana Cloud)
+      orgId: 1
+      onCallApiUrl: http://oncall-proxy:8080
+    # onCallApiToken НЕ провиженим статически — токен генерируется OnCall Engine
+    # при первом подключении через UI: Grafana → OnCall → Connect
