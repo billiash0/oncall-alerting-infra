@@ -1,0 +1,181 @@
+# ============================
+#  OnCall Alerting Infra
+#  docker-compose.yml
+#  (рабочая версия с сервис‑аккаунтом Grafana)
+# ============================
+
+services:
+
+  # -------------------------- PostgreSQL --------------------------
+  postgres:
+    image: postgres:15-alpine           # лёгкий образ, arm64 совместим
+    container_name: oncall-postgres
+    restart: always                     # самовосстановление при падении
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB_ONCALL}   # создаст БД oncall при инициализации
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # постоянное хранилище БД
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro   # скрипт создаёт БД n8n и права
+    ports:
+      - "5432:5432"                      # порт для отладки (можно убрать)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------- Redis --------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: oncall-redis
+    restart: always
+    volumes:
+      - redis_data:/data                 # персистентность кэша
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------- RabbitMQ --------------------------
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: oncall-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"          # management UI (необязательно)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------- OnCall Engine --------------------------
+  oncall-engine:
+    image: grafana/oncall:latest            # официальный образ
+    container_name: oncall-engine
+    restart: always
+    # Запускаем миграции при каждом старте, затем встроенный сервер Django
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8080"
+    environment:
+      # Django settings – модуль настроек для Dev-окружения
+      DJANGO_SETTINGS_MODULE: settings.dev
+      SECRET_KEY: ${SECRET_KEY}
+      # Тип базы данных – обязательно PostgreSQL
+      DATABASE_TYPE: postgresql
+      DATABASE_NAME: ${POSTGRES_DB_ONCALL}
+      DATABASE_USER: ${POSTGRES_USER}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      # Брокер сообщений и кэш
+      BROKER_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      # URL Grafana (необходим для OSS-установок)
+      GRAFANA_API_URL: ${GRAFANA_API_URL}
+      # Публичный URL (для вебхуков)
+      BASE_URL: ${ONCALL_BASE_URL}
+      # Telegram-бот
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      # Разрешаем любые хосты (для локальной разработки)
+      ALLOWED_HOSTS: "*"
+    ports:
+      - "8080:8080"                         # API и UI OnCall
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - oncall_media:/app/media              # постоянное хранилище для медиафайлов
+
+  # -------------------------- OnCall Celery --------------------------
+  oncall-celery:
+    image: grafana/oncall:latest
+    container_name: oncall-celery
+    restart: always
+    working_dir: /etc/app                  # рабочая директория, где лежит manage.py и engine.celery
+    command: celery -A engine worker -l info -Q default,critical,slack,telegram,webhook,retry --concurrency=4
+    environment:
+      DJANGO_SETTINGS_MODULE: settings.dev
+      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_TYPE: postgresql
+      DATABASE_NAME: ${POSTGRES_DB_ONCALL}
+      DATABASE_USER: ${POSTGRES_USER}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      BROKER_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      GRAFANA_API_URL: ${GRAFANA_API_URL}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+    depends_on:
+      - oncall-engine
+
+  # -------------------------- Grafana --------------------------
+  grafana:
+    image: grafana/grafana:10.4.1          # версия, совместимая с плагином OnCall
+    container_name: oncall-grafana
+    restart: always
+    environment:
+      # Плагин OnCall будет установлен автоматически при первом запуске
+      GF_INSTALL_PLUGINS: grafana-oncall-app
+      # Пароль администратора Grafana по умолчанию
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # --- Автоматическое подключение к OnCall Engine через сервис‑аккаунт ---
+      # Эти переменные заставляют плагин использовать предоставленный токен
+      # вместо того, чтобы запрашивать логин/пароль.
+      GF_ONCALL_STACK_ID: "1"                                 # ID стека (мы создали организацию с stack_id=1)
+      GF_ONCALL_ORG_ID: "1"
+      GF_ONCALL_API_URL: "http://oncall-engine:8080"           # URL OnCall Engine
+      GF_ONCALL_API_TOKEN: ${GRAFANA_ONCALL_SERVICE_TOKEN}     # Токен сервис‑аккаунта Grafana из .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Автоматическая настройка источника данных OnCall временно отключена,
+      # чтобы избежать ошибки «is a directory». Настроим вручную через веб-интерфейс.
+      # - ./provisioning/grafana/datasource.yaml:/etc/grafana/provisioning/datasources/datasource.yaml:ro
+
+  # -------------------------- n8n --------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: always
+    environment:
+      N8N_BASIC_AUTH_ACTIVE: "false"       # для простоты без пароля
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB_N8N}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+    ports:
+      - "${N8N_PORT}:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      # Смонтировать папку с воркфлоу не обязательно – импорт делаем вручную
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# -------------------------- Volumes --------------------------
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  oncall_media:
+  grafana_data:
+  n8n_data:
