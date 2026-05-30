@@ -1,0 +1,11 @@
+apiVersion: 1
+
+apps:
+  - type: grafana-oncall-app
+    disabled: false
+    jsonData:
+      stackId: 1
+      orgId: 1
+      onCallApiUrl: http://oncall-proxy:8080
+    secureJsonData:
+      onCallApiToken: 975b83054b084a31c77e16b5cea3305fb9e4d423e23ba2d15a1828af9838eb87
