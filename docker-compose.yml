@@ -1,0 +1,168 @@
+# ============================
+#  OnCall Alerting Infra
+#  (финальная версия с прокси и provisioning)
+# ============================
+
+services:
+
+  # -------------------------- Прокси для подстановки заголовков --------------------------
+  oncall-proxy:
+    image: nginx:alpine
+    container_name: oncall-proxy
+    restart: always
+    ports:
+      - "8080:8080"                     # внешний порт, через который Grafana ходит в Engine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - oncall-engine
+
+  # -------------------------- PostgreSQL --------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: oncall-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB_ONCALL}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------- Redis --------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: oncall-redis
+    restart: always
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------- RabbitMQ --------------------------
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: oncall-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------- OnCall Engine --------------------------
+  oncall-engine:
+    image: grafana/oncall:latest
+    container_name: oncall-engine
+    restart: always
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8080"
+    environment:
+      DJANGO_SETTINGS_MODULE: settings.hobby
+      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_TYPE: postgresql
+      DATABASE_NAME: ${POSTGRES_DB_ONCALL}
+      DATABASE_USER: ${POSTGRES_USER}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      BROKER_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      GRAFANA_API_URL: ${GRAFANA_API_URL}
+      BASE_URL: ${ONCALL_BASE_URL}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      ALLOWED_HOSTS: "*"
+    expose:
+      - "8080"                           # открыт только внутри сети
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - oncall_media:/app/media
+
+  # -------------------------- OnCall Celery --------------------------
+  oncall-celery:
+    image: grafana/oncall:latest
+    container_name: oncall-celery
+    restart: always
+    command: celery -A engine worker -l info -Q default,critical,slack,telegram,webhook,retry --concurrency=4
+    environment:
+      DJANGO_SETTINGS_MODULE: settings.hobby
+      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_TYPE: postgresql
+      DATABASE_NAME: ${POSTGRES_DB_ONCALL}
+      DATABASE_USER: ${POSTGRES_USER}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      BROKER_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      GRAFANA_API_URL: ${GRAFANA_API_URL}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+    depends_on:
+      - oncall-engine
+
+  # -------------------------- Grafana --------------------------
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: oncall-grafana
+    restart: always
+    environment:
+      GF_INSTALL_PLUGINS: grafana-oncall-app
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_FEATURE_TOGGLES_ENABLE: externalServiceAccounts
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./provisioning/plugins:/etc/grafana/provisioning/plugins:ro
+
+  # -------------------------- n8n --------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: always
+    environment:
+      N8N_BASIC_AUTH_ACTIVE: "false"
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB_N8N}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+    ports:
+      - "${N8N_PORT}:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  oncall_media:
+  grafana_data:
+  n8n_data:
