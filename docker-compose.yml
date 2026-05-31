@@ -83,6 +83,7 @@ services:
       DATABASE_PORT: 5432
       BROKER_URL: amqp://guest:guest@rabbitmq:5672/
       REDIS_URL: redis://redis:6379/0
+      REDIS_URI: redis://redis:6379/0
       GRAFANA_API_URL: ${GRAFANA_API_URL}
       BASE_URL: ${ONCALL_BASE_URL}
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
@@ -116,6 +117,7 @@ services:
       DATABASE_PORT: 5432
       BROKER_URL: amqp://guest:guest@rabbitmq:5672/
       REDIS_URL: redis://redis:6379/0
+      REDIS_URI: redis://redis:6379/0
       GRAFANA_API_URL: ${GRAFANA_API_URL}
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
     depends_on:
