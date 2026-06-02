@@ -1,36 +1,43 @@
 # ============================
 #  OnCall Alerting Infra
-#  (финальная версия с прокси и provisioning)
+#  docker-compose.yml (подробная версия с комментариями)
 # ============================
+# Этот файл описывает все сервисы, необходимые для работы Grafana OnCall,
+# а также n8n для автоматизации.
 
 services:
 
-  # -------------------------- Прокси для подстановки заголовков --------------------------
+  # -------------------------- Прокси (необязателен) --------------------------
+  # Раньше использовался для добавления заголовков X-Oncall-Stack-Id и X-Oncall-Org-Id,
+  # которые требовал Engine. После перехода на Basic Auth (логин:пароль в URL) можно удалить.
   oncall-proxy:
-    image: nginx:alpine
-    container_name: oncall-proxy
-    restart: always
+    image: nginx:alpine                 # лёгкий веб-сервер / прокси
+    container_name: oncall-proxy        # фиксированное имя контейнера
+    restart: always                     # автоматически перезапускать при падении
     ports:
-      - "8080:8080"                     # внешний порт, через который Grafana ходит в Engine
+      - "8080:8080"                     # проброс порта на хост (для доступа к Engine через прокси)
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro   # конфигурация прокси
     depends_on:
-      - oncall-engine
+      - oncall-engine                   # ждём запуска Engine
 
   # -------------------------- PostgreSQL --------------------------
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15-alpine           # лёгкий образ PostgreSQL 15
     container_name: oncall-postgres
     restart: always
     environment:
+      # Учётные данные берутся из .env
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB_ONCALL}
+      POSTGRES_DB: ${POSTGRES_DB_ONCALL}   # основная база для OnCall
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres_data:/var/lib/postgresql/data   # данные БД хранятся в томе
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro  # скрипт первичной инициализации (создаёт базу n8n и права)
+    ports:
+      - "5432:5432"                      # доступ с хоста для отладки (в production лучше убрать)
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]   # проверка готовности
       interval: 10s
       timeout: 5s
       retries: 5
@@ -41,7 +48,7 @@ services:
     container_name: oncall-redis
     restart: always
     volumes:
-      - redis_data:/data
+      - redis_data:/data                 # постоянное хранение кэша
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -50,7 +57,7 @@ services:
 
   # -------------------------- RabbitMQ --------------------------
   rabbitmq:
-    image: rabbitmq:3.12-management-alpine
+    image: rabbitmq:3.12-management-alpine   # включает веб-интерфейс управления
     container_name: oncall-rabbitmq
     restart: always
     environment:
@@ -58,6 +65,8 @@ services:
       RABBITMQ_DEFAULT_PASS: guest
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"          # порт веб-интерфейса (можно отключить)
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
       interval: 10s
@@ -66,30 +75,37 @@ services:
 
   # -------------------------- OnCall Engine --------------------------
   oncall-engine:
-    image: grafana/oncall:latest
+    image: grafana/oncall:latest          # официальный образ OnCall
     container_name: oncall-engine
     restart: always
     command: >
-      sh -c "python manage.py migrate --noinput &&
-             python manage.py runserver 0.0.0.0:8080"
+      sh -c "python manage.py migrate --noinput &&    # применяем миграции БД
+             python manage.py runserver 0.0.0.0:8080" # запускаем dev-сервер Django
     environment:
-      DJANGO_SETTINGS_MODULE: settings.hobby
+      # Настройки Django
+      DJANGO_SETTINGS_MODULE: settings.hobby   # упрощённый режим (авто-создание организации)
       SECRET_KEY: ${SECRET_KEY}
+      # Подключение к PostgreSQL
       DATABASE_TYPE: postgresql
       DATABASE_NAME: ${POSTGRES_DB_ONCALL}
       DATABASE_USER: ${POSTGRES_USER}
       DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
       DATABASE_HOST: postgres
       DATABASE_PORT: 5432
+      # Брокеры сообщений
       BROKER_URL: amqp://guest:guest@rabbitmq:5672/
       REDIS_URL: redis://redis:6379/0
       REDIS_URI: redis://redis:6379/0
+      # Связь с Grafana
       GRAFANA_API_URL: ${GRAFANA_API_URL}
+      # Публичный URL (для Telegram-вебхуков и пр.)
       BASE_URL: ${ONCALL_BASE_URL}
+      # Telegram-бот
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      # Разрешаем любые хосты для локальной разработки
       ALLOWED_HOSTS: "*"
     expose:
-      - "8080"                           # открыт только внутри сети
+      - "8080"                     # порт открыт только внутри сети (если не используется прокси)
     depends_on:
       postgres:
         condition: service_healthy
@@ -98,7 +114,7 @@ services:
       rabbitmq:
         condition: service_healthy
     volumes:
-      - oncall_media:/app/media
+      - oncall_media:/app/media    # хранилище медиафайлов (аватарки и т.п.)
 
   # -------------------------- OnCall Celery --------------------------
   oncall-celery:
@@ -125,18 +141,19 @@ services:
 
   # -------------------------- Grafana --------------------------
   grafana:
-    image: grafana/grafana:11.2.0
+    image: grafana/grafana:11.2.0     # конкретная версия Grafana
     container_name: oncall-grafana
     restart: always
     environment:
-      GF_INSTALL_PLUGINS: grafana-oncall-app
+      GF_INSTALL_PLUGINS: grafana-oncall-app   # автоустановка плагина (может быть заблокирована)
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_FEATURE_TOGGLES_ENABLE: externalServiceAccounts
+      GF_FEATURE_TOGGLES_ENABLE: externalServiceAccounts   # включает поддержку сервис-аккаунтов
     ports:
       - "3000:3000"
     volumes:
-      - grafana_data:/var/lib/grafana
+      - grafana_data:/var/lib/grafana          # дашборды, плагины, настройки
+      # Provisioning для автоматической настройки плагина (опционально)
       - ./provisioning/plugins:/etc/grafana/provisioning/plugins:ro
 
   # -------------------------- n8n --------------------------
@@ -145,22 +162,23 @@ services:
     container_name: n8n
     restart: always
     environment:
-      N8N_BASIC_AUTH_ACTIVE: "false"
+      N8N_BASIC_AUTH_ACTIVE: "false"       # без пароля (только для локальной разработки!)
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB_N8N}
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB_N8N}    # отдельная база для n8n
       DB_POSTGRESDB_USER: ${POSTGRES_USER}
       DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}     # ключ для шифрования credentials
     ports:
-      - "${N8N_PORT}:5678"
+      - "${N8N_PORT}:5678"                 # порт из .env (по умолчанию 5678)
     volumes:
       - n8n_data:/home/node/.n8n
     depends_on:
       postgres:
         condition: service_healthy
 
+# -------------------------- Volumes --------------------------
 volumes:
   postgres_data:
   redis_data:
